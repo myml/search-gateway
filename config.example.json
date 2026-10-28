@@ -1,0 +1,58 @@
+{
+  "listen": "127.0.0.1:8787",
+  "store_path": "./data/store.json",
+  "db_path": "./data/gateway.db",
+  "admin_tokens": ["change-admin-token"],
+  "auth": {
+    "tokens": ["change-client-token"]
+  },
+  "proxy": "",
+  "fallback_on_empty": true,
+  "timeout_seconds": 20,
+  "fetch_timeout_seconds": 30,
+  "default_count": 8,
+  "user_agent": "search-gateway/0.2",
+  "search": [
+    {
+      "name": "tavily",
+      "type": "tavily",
+      "api_key_env": "TAVILY_API_KEY"
+    },
+    {
+      "name": "brave",
+      "type": "brave",
+      "api_key_env": "BRAVE_API_KEY"
+    },
+    {
+      "name": "exa",
+      "type": "exa",
+      "api_key_env": "EXA_API_KEY"
+    },
+    {
+      "name": "serper",
+      "type": "serper",
+      "api_key_env": "SERPER_API_KEY"
+    },
+    {
+      "name": "bocha",
+      "type": "bocha",
+      "api_key_env": "BOCHA_API_KEY"
+    },
+    {
+      "name": "searxng",
+      "type": "searxng",
+      "base_url": "http://127.0.0.1:8888"
+    }
+  ],
+  "fetch": [
+    {
+      "name": "direct",
+      "type": "direct"
+    },
+    {
+      "name": "jina",
+      "type": "jina",
+      "api_key_env": "JINA_API_KEY"
+    }
+  ]
+}

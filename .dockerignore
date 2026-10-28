@@ -1,0 +1,13 @@
+.git
+.github
+search-gateway
+config.json
+config.example.json
+data/
+backup-*/
+docs/
+deploy/
+*.log
+*.db
+*.db-wal
+*.db-shm

@@ -1,0 +1,10 @@
+http:
+  routers:
+    search-gateway:
+      rule: "Host(`@DOMAIN@`)"
+      service: search-gateway
+  services:
+    search-gateway:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:18787

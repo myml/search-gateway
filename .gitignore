@@ -1,0 +1,11 @@
+/search-gateway
+/config.json
+.env
+deploy.env
+deploy/ct100/deploy.env
+*.log
+/data/
+/backup-*/
+*.db
+*.db-wal
+*.db-shm
