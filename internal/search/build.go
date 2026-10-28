@@ -35,6 +35,8 @@ func BuildSearchProvider(pc config.Provider, client *http.Client, userAgent stri
 		return newBocha(pc, client, pc.UserAgent)
 	case "searxng":
 		return newSearxng(pc, client, pc.UserAgent)
+	case "deepseek":
+		return newDeepSeekSearch(pc, client, pc.UserAgent)
 	default:
 		return nil, fmt.Errorf("channel type %q cannot search", pc.Type)
 	}
@@ -54,6 +56,8 @@ func BuildFetchProvider(pc config.Provider, client *http.Client, userAgent strin
 		return newDirectFetch(pc, client, pc.UserAgent)
 	case "jina":
 		return newJinaFetch(pc, client, pc.UserAgent)
+	case "deepseek":
+		return newDeepSeekFetch(pc, client, pc.UserAgent)
 	default:
 		return nil, fmt.Errorf("channel type %q cannot fetch", pc.Type)
 	}

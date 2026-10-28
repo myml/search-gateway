@@ -139,3 +139,25 @@ func TestQuotaTimezoneExpandsEnv(t *testing.T) {
 		t.Fatalf("period = %q", got)
 	}
 }
+
+func TestLoadAcceptsDeepSeekForSearchAndFetch(t *testing.T) {
+	t.Setenv("TEST_DEEPSEEK_KEY", "sk-fetch")
+	path := filepath.Join(t.TempDir(), "config.json")
+	raw := `{
+		"search": [{"type": "deepseek", "api_key": "sk-search"}],
+		"fetch": [{"name": "ds-fetch", "type": "deepseek", "api_key_env": "TEST_DEEPSEEK_KEY"}]
+	}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Search) != 1 || cfg.Search[0].Name != "deepseek" || cfg.Search[0].APIKey != "sk-search" {
+		t.Fatalf("search = %+v", cfg.Search)
+	}
+	if len(cfg.Fetch) != 1 || cfg.Fetch[0].Name != "ds-fetch" || cfg.Fetch[0].APIKey != "sk-fetch" {
+		t.Fatalf("fetch = %+v", cfg.Fetch)
+	}
+}

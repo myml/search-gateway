@@ -11,8 +11,8 @@
 
 ## 功能
 
-- **多家搜索渠道**：Tavily、Brave、Exa、Serper、Bocha、SearXNG
-- **网页抓取**：直接抓取或 Jina Reader
+- **多家搜索渠道**：Tavily、Brave、Exa、Serper、Bocha、DeepSeek、SearXNG
+- **网页抓取**：直接抓取、Jina Reader 或 DeepSeek Fetch
 - **路由策略**：顺序回退、并发聚合去重、轮询/随机负载均衡
 - **渠道月度额度**：为每个渠道设置每月调用次数上限，耗尽后自动跳过，次月自动恢复
 - **API Key 管理**：每个 Key 分别绑定一条搜索路由和一条抓取路由
@@ -113,9 +113,12 @@ export TAVILY_API_KEY="tvly-..."
 | 类型 | 角色 | 必需配置 |
 | --- | --- | --- |
 | `tavily` / `brave` / `exa` / `serper` / `bocha` | 搜索 | `api_key` 或 `api_key_env` |
+| `deepseek` | 搜索 + 抓取 | `api_key` 或 `api_key_env` |
 | `searxng` | 搜索 | `base_url`，并且 SearXNG 需要开启 JSON 输出 |
 | `direct` | 抓取 | 无 |
 | `jina` | 抓取 | 可选 `api_key` |
+
+`deepseek` 的默认 `base_url` 是 `https://api.deepseek.com/`，DeepSeek 的 Search 与 Fetch 共用同一个 API Key。新建一个 `deepseek` 渠道后，它会同时出现在「搜索渠道」和「抓取渠道」列表里，搜索路由和抓取路由都可以引用它。注意「兼容接口」里的 DeepSeek Search/Fetch API 是网关对外提供的客户端兼容接口，这里的 `deepseek` 则是网关的上游渠道，两者不是一回事。
 
 渠道还可以单独设置 `base_url`、`proxy`、`timeout_seconds`、`headers` 和 `user_agent`。`direct` 默认使用浏览器 User-Agent；部分站点对非浏览器请求不友好时，可以改用 `jina` 或给渠道配置代理。
 

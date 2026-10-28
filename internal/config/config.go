@@ -148,11 +148,11 @@ func (c *Config) applyDefaults() {
 }
 
 var searchProviderTypes = map[string]struct{}{
-	"tavily": {}, "brave": {}, "exa": {}, "serper": {}, "bocha": {}, "searxng": {},
+	"tavily": {}, "brave": {}, "exa": {}, "serper": {}, "bocha": {}, "searxng": {}, "deepseek": {},
 }
 
 var fetchProviderTypes = map[string]struct{}{
-	"direct": {}, "jina": {},
+	"direct": {}, "jina": {}, "deepseek": {},
 }
 
 func (c *Config) validate() error {

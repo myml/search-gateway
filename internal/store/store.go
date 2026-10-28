@@ -37,11 +37,11 @@ var (
 )
 
 var searchChannelTypes = map[string]struct{}{
-	"tavily": {}, "brave": {}, "exa": {}, "serper": {}, "bocha": {}, "searxng": {},
+	"tavily": {}, "brave": {}, "exa": {}, "serper": {}, "bocha": {}, "searxng": {}, "deepseek": {},
 }
 
 var fetchChannelTypes = map[string]struct{}{
-	"direct": {}, "jina": {},
+	"direct": {}, "jina": {}, "deepseek": {},
 }
 
 var channelTypes = func() map[string]struct{} {
@@ -548,7 +548,7 @@ func validateChannel(ch *Channel, d *Data) error {
 		}
 	}
 	switch ch.Type {
-	case "tavily", "brave", "exa", "serper", "bocha":
+	case "tavily", "brave", "exa", "serper", "bocha", "deepseek":
 		if ch.Config.APIKey == "" {
 			return fmt.Errorf("%w: channel %q requires api_key", ErrInvalid, ch.Name)
 		}

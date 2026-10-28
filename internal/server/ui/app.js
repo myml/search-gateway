@@ -43,6 +43,7 @@
     exa: "https://api.exa.ai/",
     serper: "https://google.serper.dev/",
     bocha: "https://api.bochaai.com/",
+    deepseek: "https://api.deepseek.com/",
     searxng: "",
     direct: "",
     jina: "https://r.jina.ai/",
@@ -53,13 +54,14 @@
     exa: "默认 https://api.exa.ai/，填 API Key 即可；被地区拦截时可配置代理。",
     serper: "默认 https://google.serper.dev/，填 API Key 即可。",
     bocha: "默认 https://api.bochaai.com/，填 API Key 即可。",
+    deepseek: "默认 https://api.deepseek.com/，填 DeepSeek API Key 即可，搜索与抓取共用同一个 Key。",
     searxng: "必填，例如 http://127.0.0.1:8888；SearXNG 需在 settings.yml 打开 formats: [html, json]。",
     direct: "抓取直连，不需要 Base URL；会使用浏览器 UA 请求目标页面。",
     jina: "默认 https://r.jina.ai/，可选 API Key。",
   };
   const CHANNEL_ROLE_TYPES = {
-    search: ["tavily", "brave", "exa", "serper", "bocha", "searxng"],
-    fetch: ["direct", "jina"],
+    search: ["tavily", "brave", "exa", "serper", "bocha", "deepseek", "searxng"],
+    fetch: ["direct", "jina", "deepseek"],
   };
 
   const PROVIDER_SITES = {
@@ -68,6 +70,7 @@
     exa: "https://exa.ai/",
     serper: "https://serper.dev/",
     bocha: "https://bochaai.com/",
+    deepseek: "https://platform.deepseek.com/",
     searxng: "https://docs.searxng.org/",
     jina: "https://jina.ai/",
   };

@@ -19,6 +19,71 @@ func newTestStore(t *testing.T) *Store {
 	return st
 }
 
+func TestDeepSeekChannelServesBothRoles(t *testing.T) {
+	st := newTestStore(t)
+	if _, err := st.CreateChannel(Channel{Name: "ds", Type: "deepseek", Enabled: true}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("missing api_key error = %v", err)
+	}
+	channel, err := st.CreateChannel(Channel{
+		Name: "ds", Type: "deepseek", Enabled: true,
+		Config: config.Provider{APIKey: "sk-deepseek"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if caps := channel.Capabilities(); len(caps) != 2 || caps[0] != "search" || caps[1] != "fetch" {
+		t.Fatalf("capabilities = %v", caps)
+	}
+	// The same channel is a valid target for a search route and a fetch route.
+	if _, err := st.CreateRoute(Route{Name: "ds-search", Role: "search", Mode: "fallback", Enabled: true, SearchChannels: []string{channel.ID}}); err != nil {
+		t.Fatalf("search route: %v", err)
+	}
+	if _, err := st.CreateRoute(Route{Name: "ds-fetch", Role: "fetch", Mode: "fallback", Enabled: true, FetchChannels: []string{channel.ID}}); err != nil {
+		t.Fatalf("fetch route: %v", err)
+	}
+	// base_url stays optional: the provider falls back to the official endpoint.
+	if channel.Config.BaseURL != "" {
+		t.Fatalf("base url = %q", channel.Config.BaseURL)
+	}
+}
+
+func TestSeedMergesSameNameChannelAcrossRoles(t *testing.T) {
+	st := newTestStore(t)
+	cfg := &config.Config{
+		Search: []config.Provider{{Name: "deepseek", Type: "deepseek", APIKey: "sk-deepseek"}},
+		Fetch:  []config.Provider{{Name: "deepseek", Type: "deepseek", APIKey: "sk-deepseek"}},
+	}
+	if err := st.SeedFromConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := st.Snapshot()
+	if len(snapshot.Channels) != 1 {
+		t.Fatalf("channels = %+v", snapshot.Channels)
+	}
+	channel := snapshot.Channels[0]
+	if caps := channel.Capabilities(); len(caps) != 2 {
+		t.Fatalf("capabilities = %v", caps)
+	}
+	var searchRoute, fetchRoute *Route
+	for i := range snapshot.Routes {
+		switch snapshot.Routes[i].Role {
+		case "search":
+			searchRoute = &snapshot.Routes[i]
+		case "fetch":
+			fetchRoute = &snapshot.Routes[i]
+		}
+	}
+	if searchRoute == nil || fetchRoute == nil {
+		t.Fatalf("routes = %+v", snapshot.Routes)
+	}
+	if len(searchRoute.SearchChannels) != 1 || searchRoute.SearchChannels[0] != channel.ID {
+		t.Fatalf("search route targets = %+v", searchRoute)
+	}
+	if len(fetchRoute.FetchChannels) != 1 || fetchRoute.FetchChannels[0] != channel.ID {
+		t.Fatalf("fetch route targets = %+v", fetchRoute)
+	}
+}
+
 func TestSeedFromConfig(t *testing.T) {
 	st := newTestStore(t)
 	cfg := &config.Config{
