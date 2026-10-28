@@ -337,9 +337,11 @@
   .divider { height: 1px; background: var(--border); margin: 16px 0; }
 
   /* ---------- forms ---------- */
-  .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+  /* align-items: start keeps fields top-aligned: a field with a help text must not
+     stretch its neighbor, otherwise that neighbor's label/input are pushed down. */
+  .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-items: start; }
   .form-grid.cols-1 { grid-template-columns: minmax(0, 1fr); }
-  .field { display: grid; gap: 6px; }
+  .field { display: grid; gap: 6px; align-content: start; }
   .field.full { grid-column: 1 / -1; }
   .field-label { font-size: 12.5px; font-weight: 500; color: var(--text-2); display: flex; align-items: center; gap: 5px; }
   .field-label .req { color: var(--err); }
@@ -717,3 +719,25 @@
   }
   .table tr.clickable { cursor: pointer; }
   .table tr.clickable:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  /* ---------- channel monthly quota ---------- */
+  .quota { display: grid; gap: 4px; min-width: 128px; }
+  .field .quota { min-width: 0; }
+  .quota-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-height: 18px; }
+  .quota-count { font-size: 12.5px; color: var(--text-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .quota-meta { font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .quota-bar { height: 4px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
+  .quota-bar > span { display: block; height: 100%; border-radius: inherit; background: var(--ok); transition: width .2s ease; }
+  .quota .tag { height: 18px; padding: 0 6px; font-size: 11px; }
+  .quota.warn .quota-bar > span { background: var(--warn); }
+  .quota.warn .quota-count, .quota.warn .quota-meta { color: var(--warn); }
+  .quota.err .quota-bar > span { background: var(--err); }
+  .quota.err .quota-count { color: var(--err); }
+  .table .quota { max-width: 196px; }
+  .quota-mini { margin-top: 3px; font-size: 11.5px; line-height: 1.45; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .quota-mini.warn { color: var(--warn); }
+  .quota-mini.err { color: var(--err); }
+  .quota-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  @media (max-width: 760px) {
+    .table .quota { max-width: 100%; }
+  }

@@ -31,6 +31,14 @@ type ChannelStats struct {
 	LastUsedAt     *time.Time `json:"last_used_at,omitempty"`
 }
 
+// ChannelUsage is the call counter of one channel in one quota period. The
+// period is a calendar month formatted as "2006-01"; the time zone that decides
+// where a month starts belongs to the configuration, not to the database.
+type ChannelUsage struct {
+	Requests int64 `json:"requests"`
+	Errors   int64 `json:"errors"`
+}
+
 // ChannelTest is the persisted result of the last connectivity test.
 type ChannelTest struct {
 	OK           bool      `json:"ok"`
@@ -110,6 +118,14 @@ CREATE TABLE IF NOT EXISTS channel_tests (
 	latency_ms INTEGER NOT NULL DEFAULT 0,
 	tested_at TEXT NOT NULL,
 	PRIMARY KEY (channel_id, role)
+);
+
+CREATE TABLE IF NOT EXISTS channel_usage (
+	channel_id TEXT NOT NULL,
+	period TEXT NOT NULL,
+	requests INTEGER NOT NULL DEFAULT 0,
+	errors INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (channel_id, period)
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -454,6 +470,116 @@ func (d *DB) ChannelStats() (map[string]ChannelStats, error) {
 		out[id] = stat
 	}
 	return out, rows.Err()
+}
+
+// ChannelUsage returns all channel usage counters of one quota period.
+func (d *DB) ChannelUsage(period string) (map[string]ChannelUsage, error) {
+	if strings.TrimSpace(period) == "" {
+		return map[string]ChannelUsage{}, nil
+	}
+	rows, err := d.sql.Query(`SELECT channel_id, requests, errors FROM channel_usage WHERE period = ?`, period)
+	if err != nil {
+		return nil, fmt.Errorf("query channel usage: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]ChannelUsage{}
+	for rows.Next() {
+		var id string
+		var usage ChannelUsage
+		if err := rows.Scan(&id, &usage.Requests, &usage.Errors); err != nil {
+			return nil, err
+		}
+		out[id] = usage
+	}
+	return out, rows.Err()
+}
+
+// ConsumeChannelQuota records one upstream call attempt against a channel's
+// monthly quota and reports whether the call may proceed. A limit of zero means
+// unlimited usage. The check and the increment are part of a single SQL
+// statement, so concurrent requests cannot exceed a limit.
+func (d *DB) ConsumeChannelQuota(channelID, period string, limit int64) (bool, error) {
+	channelID = strings.TrimSpace(channelID)
+	period = strings.TrimSpace(period)
+	if channelID == "" || period == "" {
+		return true, nil
+	}
+	if limit <= 0 {
+		_, err := d.sql.Exec(`
+			INSERT INTO channel_usage (channel_id, period, requests, errors)
+			VALUES (?, ?, 1, 0)
+			ON CONFLICT(channel_id, period) DO UPDATE SET requests = channel_usage.requests + 1`,
+			channelID, period)
+		if err != nil {
+			return false, fmt.Errorf("record channel usage: %w", err)
+		}
+		return true, nil
+	}
+	result, err := d.sql.Exec(`
+		INSERT INTO channel_usage (channel_id, period, requests, errors)
+		VALUES (?, ?, 1, 0)
+		ON CONFLICT(channel_id, period) DO UPDATE SET requests = channel_usage.requests + 1
+		WHERE channel_usage.requests < ?`,
+		channelID, period, limit)
+	if err != nil {
+		return false, fmt.Errorf("consume channel quota: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("consume channel quota: %w", err)
+	}
+	return affected > 0, nil
+}
+
+// RecordChannelUsageError counts a failed upstream call in the period. The
+// request itself is already counted by ConsumeChannelQuota.
+func (d *DB) RecordChannelUsageError(channelID, period string) error {
+	channelID = strings.TrimSpace(channelID)
+	period = strings.TrimSpace(period)
+	if channelID == "" || period == "" {
+		return nil
+	}
+	_, err := d.sql.Exec(`
+		INSERT INTO channel_usage (channel_id, period, requests, errors)
+		VALUES (?, ?, 0, 1)
+		ON CONFLICT(channel_id, period) DO UPDATE SET errors = channel_usage.errors + 1`,
+		channelID, period)
+	if err != nil {
+		return fmt.Errorf("record channel usage error: %w", err)
+	}
+	return nil
+}
+
+// ResetChannelUsage deletes the counter row of one channel in one period. An
+// empty channelID resets the whole period.
+func (d *DB) ResetChannelUsage(period, channelID string) error {
+	period = strings.TrimSpace(period)
+	if period == "" {
+		return fmt.Errorf("period is required")
+	}
+	var err error
+	if strings.TrimSpace(channelID) == "" {
+		_, err = d.sql.Exec(`DELETE FROM channel_usage WHERE period = ?`, period)
+	} else {
+		_, err = d.sql.Exec(`DELETE FROM channel_usage WHERE period = ? AND channel_id = ?`, period, channelID)
+	}
+	if err != nil {
+		return fmt.Errorf("reset channel usage: %w", err)
+	}
+	return nil
+}
+
+// DeleteChannelUsage removes every period row of a channel. It is called when
+// the channel itself is deleted from the store.
+func (d *DB) DeleteChannelUsage(channelID string) error {
+	channelID = strings.TrimSpace(channelID)
+	if channelID == "" {
+		return nil
+	}
+	if _, err := d.sql.Exec(`DELETE FROM channel_usage WHERE channel_id = ?`, channelID); err != nil {
+		return fmt.Errorf("delete channel usage: %w", err)
+	}
+	return nil
 }
 
 // RecordChannelTest upserts the last connectivity test of a channel.

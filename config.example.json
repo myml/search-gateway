@@ -3,6 +3,7 @@
   "store_path": "./data/store.json",
   "db_path": "./data/gateway.db",
   "admin_tokens": ["change-admin-token"],
+  "quota_timezone": "UTC",
   "auth": {
     "tokens": ["change-client-token"]
   },

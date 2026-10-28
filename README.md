@@ -14,6 +14,7 @@
 - **多家搜索渠道**：Tavily、Brave、Exa、Serper、Bocha、SearXNG
 - **网页抓取**：直接抓取或 Jina Reader
 - **路由策略**：顺序回退、并发聚合去重、轮询/随机负载均衡
+- **渠道月度额度**：为每个渠道设置每月调用次数上限，耗尽后自动跳过，次月自动恢复
 - **API Key 管理**：每个 Key 分别绑定一条搜索路由和一条抓取路由
 - **管理控制台**：渠道、路由、Key、调用日志、渠道测试
 - **兼容接口**：REST、DeepSeek Search/Fetch API、Anthropic Messages、MCP
@@ -93,6 +94,7 @@ cp config.example.json config.json
 | `auth.tokens` | 旧版兼容：首次启动时种子成 API Key | 空 |
 | `store_path` | 渠道 / 路由 / Key 的存储文件 | `./data/store.json` |
 | `db_path` | 调用日志和统计的 SQLite 文件 | `./data/gateway.db` |
+| `quota_timezone` | 渠道月度额度重置所用的自然月时区（IANA 名称） | `UTC` |
 | `proxy` | 全局出站代理，支持 http/https/socks5 | 空 |
 | `timeout_seconds` | 搜索超时 | `20` |
 | `fetch_timeout_seconds` | 抓取超时 | `30` |
@@ -197,7 +199,7 @@ curl -s "http://localhost:8787/fetch?url=https%3A%2F%2Fexample.com" \
 - `X-Search-Channels`：实际使用的渠道
 - `X-Search-Provider`：第一个渠道，兼容旧客户端
 
-常见错误：无效 Key 返回 `401`；路由没有可用渠道返回 `503`；渠道全部失败返回 `502`；参数错误返回 `400`。
+常见错误：无效 Key 返回 `401`；路由没有可用渠道或候选渠道的月度额度全部耗尽返回 `503`；渠道全部失败返回 `502`；参数错误返回 `400`。
 
 ## 在 DSH 中使用
 
@@ -261,12 +263,59 @@ MCP 端点是精简的无状态实现，不分配 session，也不推送 SSE。K
 - 搜索路由只能引用搜索组，抓取路由只能引用抓取组；禁止循环引用。
 - 删除仍被 API Key 引用的路由会失败，需要先调整 Key。
 
+## 渠道月度额度
+
+每个渠道可以设置每月调用次数上限，用来控制上游成本。额度按月自动重置，不需要额外的定时任务。
+
+### 计数规则
+
+- 单位是「次」，只统计真正发往上游的调用：搜索和抓取都算，成功和失败都算（失败同时计入错误数）。
+- 同一个渠道的搜索和抓取共用一个额度，按渠道合计，不按 Key 分开计算。
+- `monthly_quota` 为 `0` 或留空表示不限量；不限量时调用次数和错误数仍然照常统计。
+
+### 达到额度后
+
+- 路由引擎会自动跳过额度已耗尽的渠道，不会改动渠道的启停状态；`fallback`、`merge`、`balance` 和嵌套组的行为一致。
+- 其它还有额度的渠道照常工作；如果一条路由的所有候选渠道都耗尽，接口返回 `503`，错误信息包含 `monthly quota exhausted`。
+- 额度可以随时调大、调小或清零；调小到低于本月已用量时，该渠道会立即被视为耗尽。
+
+### 自然月与时区
+
+- 额度按 `quota_timezone` 配置的时区划分自然月（默认 `UTC`），跨月后自动使用新月份的计数，不需要重启或定时任务。
+- 例如 `"quota_timezone": "Asia/Shanghai"` 表示按北京时间每月 1 日 0 点重置。
+
+### 测试与额度
+
+- 管理台的「测试渠道」直接调用上游，不受额度限制，也不计入用量。
+- 「测试 API Key」会走正常路由，受额度限制，并计入用量。
+
+### 配置与管理 API
+
+渠道额度可以在管理台渠道编辑页设置，也可以直接调用管理 API：
+
+```sh
+curl -s -X PATCH http://localhost:8787/admin/api/channels/<channel-id> \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"monthly_quota": 1000}'
+```
+
+渠道对象会返回 `quota` 字段（`monthly_limit`、`used`、`errors`、`remaining`、`unlimited`、`exhausted`、`period`、`resets_at`）；需要清零当月用量时调用 `POST /admin/api/channels/{id}/quota/reset`。
+
+全局时区写在配置文件里：
+
+```json
+{
+  "quota_timezone": "Asia/Shanghai"
+}
+```
+
 ## 管理控制台
 
 控制台是内置的单页应用，不需要单独部署前端，也不需要 npm。
 
 - **概览**：渠道、路由、Key 数量，最近调用和渠道状态
-- **搜索渠道 / 抓取渠道**：分别管理对应角色的上游，支持单个测试和批量测试
+- **搜索渠道 / 抓取渠道**：分别管理对应角色的上游，支持单个测试和批量测试；列表展示本月额度与用量，编辑页可设置月度额度、重置本月用量
 - **搜索路由 / 抓取路由**：配置目标顺序和执行模式，支持嵌套组
 - **API Key**：签发、启停、删除、查看用量，并可直接测试
 - **调用日志**：按协议、状态、路由、Key 和关键字过滤，查看请求详情
@@ -285,7 +334,8 @@ MCP 端点是精简的无状态实现，不分配 session，也不推送 SSE。K
 
 ## 限制
 
-- 不支持 SSE 流式输出，也不提供按 Key 的 QPS/配额。
+- 不支持 SSE 流式输出。
+- 支持渠道级月度调用次数额度，但不提供按 Key 的 QPS 或配额。
 - `direct` 的正文提取是启发式清洗，复杂页面建议使用 `jina`。
 - 日志目前没有自动按天清理，需要的话可以自行加定时任务。
 - 配置仍然是 JSON 文件，适合中小规模单实例；更大规模建议换外部数据库和独立配置服务。

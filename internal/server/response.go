@@ -46,6 +46,8 @@ func gatewayStatus(err error) int {
 		return http.StatusOK
 	case errors.Is(err, routing.ErrNoChannel):
 		return http.StatusServiceUnavailable
+	case errors.Is(err, routing.ErrQuotaExhausted):
+		return http.StatusServiceUnavailable
 	case errors.Is(err, store.ErrNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, store.ErrInvalid):

@@ -417,3 +417,62 @@ func TestMigrateRemovesGenericChannels(t *testing.T) {
 		t.Fatalf("revision after migration = %d", snapshot.Revision)
 	}
 }
+
+func TestChannelMonthlyQuota(t *testing.T) {
+	st := newTestStore(t)
+
+	if _, err := st.CreateChannel(Channel{
+		Name: "neg", Type: "searxng", Enabled: true, MonthlyQuota: -1,
+		Config: config.Provider{BaseURL: "http://127.0.0.1:8888"},
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("negative quota error = %v", err)
+	}
+
+	channel, err := st.CreateChannel(Channel{
+		Name: "quota", Type: "searxng", Enabled: true, MonthlyQuota: 100,
+		Config: config.Provider{BaseURL: "http://127.0.0.1:8888"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if channel.MonthlyQuota != 100 {
+		t.Fatalf("created quota = %d", channel.MonthlyQuota)
+	}
+
+	updated, err := st.UpdateChannel(channel.ID, Channel{
+		Name: "quota", Type: "searxng", Enabled: true, MonthlyQuota: 250,
+		Config: config.Provider{BaseURL: "http://127.0.0.1:8888"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.MonthlyQuota != 250 {
+		t.Fatalf("updated quota = %d", updated.MonthlyQuota)
+	}
+
+	// Quota survives a restart; an empty patch value means unlimited.
+	reopened, err := Open(st.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored int64 = -1
+	for _, ch := range reopened.Snapshot().Channels {
+		if ch.ID == channel.ID {
+			stored = ch.MonthlyQuota
+		}
+	}
+	if stored != 250 {
+		t.Fatalf("persisted quota = %d", stored)
+	}
+	if _, err := reopened.UpdateChannel(channel.ID, Channel{
+		Name: "quota", Type: "searxng", Enabled: true, MonthlyQuota: 0,
+		Config: config.Provider{BaseURL: "http://127.0.0.1:8888"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, ch := range reopened.Snapshot().Channels {
+		if ch.ID == channel.ID && ch.MonthlyQuota != 0 {
+			t.Fatalf("quota after clear = %d", ch.MonthlyQuota)
+		}
+	}
+}

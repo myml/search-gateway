@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoadExpandsEnvAndAppliesDefaults(t *testing.T) {
@@ -67,5 +68,74 @@ func TestLoadRejectsUnsupportedProviderType(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected an error for the removed generic type")
+	}
+}
+
+func TestQuotaPeriodUsesConfiguredTimezone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"quota_timezone": "Asia/Shanghai"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 2026-10-31T16:30:00Z is already 2026-11-01 00:30 in Shanghai.
+	at := time.Date(2026, 10, 31, 16, 30, 0, 0, time.UTC)
+	if got := cfg.QuotaPeriod(at); got != "2026-11" {
+		t.Fatalf("period = %q", got)
+	}
+	start, end := cfg.QuotaPeriodBounds(at)
+	if want := time.Date(2026, 10, 31, 16, 0, 0, 0, time.UTC); !start.Equal(want) {
+		t.Fatalf("start = %s, want %s", start, want)
+	}
+	if want := time.Date(2026, 11, 30, 16, 0, 0, 0, time.UTC); !end.Equal(want) {
+		t.Fatalf("end = %s, want %s", end, want)
+	}
+}
+
+func TestQuotaTimezoneDefaultsToUTC(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 31, 23, 30, 0, 0, time.UTC)
+	if got := cfg.QuotaPeriod(at); got != "2026-10" {
+		t.Fatalf("period = %q", got)
+	}
+	if cfg.QuotaLocation() != time.UTC {
+		t.Fatalf("location = %s", cfg.QuotaLocation())
+	}
+}
+
+func TestLoadRejectsInvalidQuotaTimezone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"quota_timezone": "Mars/Olympus"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for an invalid quota_timezone")
+	}
+}
+
+func TestQuotaTimezoneExpandsEnv(t *testing.T) {
+	t.Setenv("TEST_QUOTA_TZ", "Asia/Shanghai")
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"quota_timezone": "${TEST_QUOTA_TZ}"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.QuotaTimezone != "Asia/Shanghai" {
+		t.Fatalf("quota_timezone = %q", cfg.QuotaTimezone)
+	}
+	if got := cfg.QuotaPeriod(time.Date(2026, 10, 31, 16, 30, 0, 0, time.UTC)); got != "2026-11" {
+		t.Fatalf("period = %q", got)
 	}
 }

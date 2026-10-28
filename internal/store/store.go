@@ -57,13 +57,18 @@ var channelTypes = func() map[string]struct{} {
 
 // Channel is one configured search/fetch upstream.
 type Channel struct {
-	ID        string          `json:"id"`
-	Name      string          `json:"name"`
-	Type      string          `json:"type"`
-	Config    config.Provider `json:"config"`
-	Enabled   bool            `json:"enabled"`
-	CreatedAt time.Time       `json:"created_at"`
-	UpdatedAt time.Time       `json:"updated_at"`
+	ID      string          `json:"id"`
+	Name    string          `json:"name"`
+	Type    string          `json:"type"`
+	Config  config.Provider `json:"config"`
+	Enabled bool            `json:"enabled"`
+	// MonthlyQuota caps how many upstream calls this channel may serve per
+	// calendar month. Zero means unlimited. Usage is counted in SQLite, and a
+	// channel at its quota is skipped by the routing engine until the next
+	// period starts, so this field never flips Enabled.
+	MonthlyQuota int64     `json:"monthly_quota,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 // Capabilities lists the roles this channel can serve.
@@ -485,6 +490,7 @@ func (s *Store) UpdateChannel(id string, patch Channel) (Channel, error) {
 		updated.Type = patch.Type
 		updated.Enabled = patch.Enabled
 		updated.Config = patch.Config
+		updated.MonthlyQuota = patch.MonthlyQuota
 		if strings.TrimSpace(updated.Config.APIKey) == "" {
 			updated.Config.APIKey = current.Config.APIKey
 		} else if updated.Config.APIKey == "__clear__" {
@@ -532,6 +538,9 @@ func validateChannel(ch *Channel, d *Data) error {
 	}
 	if _, ok := channelTypes[ch.Type]; !ok {
 		return fmt.Errorf("%w: unknown channel type %q", ErrInvalid, ch.Type)
+	}
+	if ch.MonthlyQuota < 0 {
+		return fmt.Errorf("%w: monthly_quota cannot be negative", ErrInvalid)
 	}
 	for _, other := range d.Channels {
 		if other.ID != ch.ID && strings.EqualFold(other.Name, ch.Name) {

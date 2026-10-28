@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"os"
 	"time"
+	// Embed the IANA database so quota_timezone works in minimal images that
+	// ship without tzdata (for example the Alpine runtime image).
+	_ "time/tzdata"
 )
 
 // Config is the top-level gateway configuration.
@@ -22,9 +25,14 @@ type Config struct {
 	FetchTimeoutSeconds int        `json:"fetch_timeout_seconds"`
 	DefaultCount        int        `json:"default_count"`
 	AdminTokens         []string   `json:"admin_tokens"`
+	QuotaTimezone       string     `json:"quota_timezone"`
 	Auth                Auth       `json:"auth"`
 	Search              []Provider `json:"search"`
 	Fetch               []Provider `json:"fetch"`
+
+	// quotaLocation is the resolved form of QuotaTimezone. It is set while
+	// loading the configuration; a zero value means UTC.
+	quotaLocation *time.Location
 }
 
 // Auth configures the bearer tokens accepted by the HTTP surface.
@@ -73,6 +81,7 @@ func (c *Config) expandEnv() {
 	c.LogPath = os.ExpandEnv(c.LogPath)
 	c.UserAgent = os.ExpandEnv(c.UserAgent)
 	c.Proxy = os.ExpandEnv(c.Proxy)
+	c.QuotaTimezone = os.ExpandEnv(c.QuotaTimezone)
 	for i := range c.AdminTokens {
 		c.AdminTokens[i] = os.ExpandEnv(c.AdminTokens[i])
 	}
@@ -126,6 +135,9 @@ func (c *Config) applyDefaults() {
 	if c.DefaultCount > 50 {
 		c.DefaultCount = 50
 	}
+	if c.QuotaTimezone == "" {
+		c.QuotaTimezone = "UTC"
+	}
 	for _, list := range [][]Provider{c.Search, c.Fetch} {
 		for i := range list {
 			if list[i].Name == "" {
@@ -157,6 +169,11 @@ func (c *Config) validate() error {
 			return fmt.Errorf("fetch provider %q: unsupported type %q", p.Name, p.Type)
 		}
 	}
+	loc, err := time.LoadLocation(c.QuotaTimezone)
+	if err != nil {
+		return fmt.Errorf("quota_timezone %q is not a valid IANA time zone: %w", c.QuotaTimezone, err)
+	}
+	c.quotaLocation = loc
 	return nil
 }
 
@@ -176,4 +193,28 @@ func (c *Config) ProviderTimeout(p Provider, fallback time.Duration) time.Durati
 		return time.Duration(p.TimeoutSeconds) * time.Second
 	}
 	return fallback
+}
+
+// QuotaLocation returns the time zone whose calendar month defines channel
+// quota periods. It defaults to UTC when the configuration was not loaded.
+func (c *Config) QuotaLocation() *time.Location {
+	if c == nil || c.quotaLocation == nil {
+		return time.UTC
+	}
+	return c.quotaLocation
+}
+
+// QuotaPeriod returns the quota period key ("2026-10") that t belongs to.
+func (c *Config) QuotaPeriod(t time.Time) string {
+	return t.In(c.QuotaLocation()).Format("2006-01")
+}
+
+// QuotaPeriodBounds returns the inclusive start and exclusive end of the quota
+// period that t belongs to, in the configured quota time zone.
+func (c *Config) QuotaPeriodBounds(t time.Time) (start, end time.Time) {
+	loc := c.QuotaLocation()
+	local := t.In(loc)
+	start = time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, loc)
+	end = start.AddDate(0, 1, 0)
+	return start, end
 }

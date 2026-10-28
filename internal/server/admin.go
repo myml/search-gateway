@@ -9,13 +9,62 @@ import (
 	"time"
 
 	"search-gateway/internal/config"
+	"search-gateway/internal/db"
 	"search-gateway/internal/logstore"
 	"search-gateway/internal/routing"
 	"search-gateway/internal/search"
 	"search-gateway/internal/store"
 )
 
-func (s *Server) channelDTO(ch store.Channel, stat *routing.ChannelStats) map[string]any {
+// quotaSnapshot is the channel usage state of one request. Every DTO builder
+// receives it so a channel listing only queries SQLite once, and all channels
+// report the same period/reset boundary.
+type quotaSnapshot struct {
+	period   string
+	resetsAt time.Time
+	usage    map[string]db.ChannelUsage
+}
+
+func (s *Server) loadQuotaSnapshot() quotaSnapshot {
+	now := time.Now()
+	period := s.cfg.QuotaPeriod(now)
+	_, resetsAt := s.cfg.QuotaPeriodBounds(now)
+	usage, err := s.db.ChannelUsage(period)
+	if err != nil {
+		s.log.Warn("load channel usage failed", "period", period, "err", err)
+		usage = map[string]db.ChannelUsage{}
+	}
+	return quotaSnapshot{period: period, resetsAt: resetsAt, usage: usage}
+}
+
+// channelQuotaDTO renders the monthly quota object of one channel. A limit of
+// zero means unlimited: remaining stays zero and exhausted is always false,
+// while usage keeps being reported.
+func channelQuotaDTO(ch store.Channel, snapshot quotaSnapshot) map[string]any {
+	used := snapshot.usage[ch.ID]
+	unlimited := ch.MonthlyQuota <= 0
+	remaining := int64(0)
+	exhausted := false
+	if !unlimited {
+		remaining = ch.MonthlyQuota - used.Requests
+		if remaining < 0 {
+			remaining = 0
+		}
+		exhausted = used.Requests >= ch.MonthlyQuota
+	}
+	return map[string]any{
+		"monthly_limit": ch.MonthlyQuota,
+		"used":          used.Requests,
+		"errors":        used.Errors,
+		"remaining":     remaining,
+		"unlimited":     unlimited,
+		"exhausted":     exhausted,
+		"period":        snapshot.period,
+		"resets_at":     snapshot.resetsAt,
+	}
+}
+
+func (s *Server) channelDTO(ch store.Channel, stat *routing.ChannelStats, quota quotaSnapshot) map[string]any {
 	cfg := map[string]any{
 		"base_url":        ch.Config.BaseURL,
 		"proxy":           ch.Config.Proxy,
@@ -39,6 +88,7 @@ func (s *Server) channelDTO(ch store.Channel, stat *routing.ChannelStats) map[st
 		"config":       cfg,
 		"stats":        stats,
 		"tests":        s.channelChecks(ch.ID),
+		"quota":        channelQuotaDTO(ch, quota),
 		"created_at":   ch.CreatedAt,
 		"updated_at":   ch.UpdatedAt,
 	}
@@ -87,13 +137,14 @@ func (s *Server) keyDTO(key store.APIKey, routeNames map[string]string, stats ma
 
 func (s *Server) channelDTOs(snapshot store.Data) []any {
 	stats := s.engine.Stats()
+	quota := s.loadQuotaSnapshot()
 	out := make([]any, 0, len(snapshot.Channels))
 	for _, ch := range snapshot.Channels {
 		var stat *routing.ChannelStats
 		if v, ok := stats[ch.ID]; ok {
 			stat = &v
 		}
-		out = append(out, s.channelDTO(ch, stat))
+		out = append(out, s.channelDTO(ch, stat, quota))
 	}
 	return out
 }
@@ -143,11 +194,15 @@ func (s *Server) handleAdminListChannels(w http.ResponseWriter, _ *http.Request)
 	writeJSON(w, http.StatusOK, map[string]any{"channels": s.channelDTOs(snapshot)})
 }
 
+// channelInput is a partial channel update. A nil field was absent from the
+// request body and keeps its current value, so old clients that PATCH only the
+// enabled flag (or only the quota) never wipe the other fields.
 type channelInput struct {
-	Name    string          `json:"name"`
-	Type    string          `json:"type"`
-	Enabled *bool           `json:"enabled"`
-	Config  config.Provider `json:"config"`
+	Name         *string          `json:"name"`
+	Type         *string          `json:"type"`
+	Enabled      *bool            `json:"enabled"`
+	Config       *config.Provider `json:"config"`
+	MonthlyQuota *int64           `json:"monthly_quota"`
 }
 
 func (s *Server) handleAdminCreateChannel(w http.ResponseWriter, r *http.Request) {
@@ -156,11 +211,22 @@ func (s *Server) handleAdminCreateChannel(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
-	enabled := true
+	candidate := store.Channel{Enabled: true}
 	if in.Enabled != nil {
-		enabled = *in.Enabled
+		candidate.Enabled = *in.Enabled
 	}
-	candidate := store.Channel{Name: in.Name, Type: in.Type, Config: in.Config, Enabled: enabled}
+	if in.Name != nil {
+		candidate.Name = *in.Name
+	}
+	if in.Type != nil {
+		candidate.Type = *in.Type
+	}
+	if in.Config != nil {
+		candidate.Config = *in.Config
+	}
+	if in.MonthlyQuota != nil {
+		candidate.MonthlyQuota = *in.MonthlyQuota
+	}
 	if err := s.engine.ValidateChannel(candidate); err != nil {
 		writeError(w, http.StatusBadRequest, "channel validation failed: "+err.Error())
 		return
@@ -170,7 +236,7 @@ func (s *Server) handleAdminCreateChannel(w http.ResponseWriter, r *http.Request
 		s.storeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, s.channelDTO(created, nil))
+	writeJSON(w, http.StatusCreated, s.channelDTO(created, nil, s.loadQuotaSnapshot()))
 }
 
 func (s *Server) handleAdminUpdateChannel(w http.ResponseWriter, r *http.Request) {
@@ -193,40 +259,88 @@ func (s *Server) handleAdminUpdateChannel(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusNotFound, "channel not found")
 		return
 	}
-	enabled := current.Enabled
-	if in.Enabled != nil {
-		enabled = *in.Enabled
-	}
 	effective := *current
-	effective.Name = in.Name
-	effective.Type = in.Type
-	effective.Enabled = enabled
-	effective.Config = in.Config
-	if strings.TrimSpace(in.Config.APIKey) == "" {
-		effective.Config.APIKey = current.Config.APIKey
-	} else if in.Config.APIKey == "__clear__" {
-		effective.Config.APIKey = ""
+	if in.Name != nil {
+		effective.Name = *in.Name
+	}
+	if in.Type != nil {
+		effective.Type = *in.Type
+	}
+	if in.Enabled != nil {
+		effective.Enabled = *in.Enabled
+	}
+	if in.Config != nil {
+		effective.Config = *in.Config
+		if strings.TrimSpace(effective.Config.APIKey) == "" {
+			effective.Config.APIKey = current.Config.APIKey
+		} else if effective.Config.APIKey == "__clear__" {
+			effective.Config.APIKey = ""
+		}
+	}
+	if in.MonthlyQuota != nil {
+		effective.MonthlyQuota = *in.MonthlyQuota
 	}
 	if err := s.engine.ValidateChannel(effective); err != nil {
 		writeError(w, http.StatusBadRequest, "channel validation failed: "+err.Error())
 		return
 	}
+	// UpdateChannel replaces the whole config; keep the "__clear__" marker so it
+	// can still remove a stored API key.
+	patchConfig := effective.Config
+	if in.Config != nil && in.Config.APIKey == "__clear__" {
+		patchConfig.APIKey = "__clear__"
+	}
 	updated, err := s.store.UpdateChannel(id, store.Channel{
-		Name: in.Name, Type: in.Type, Config: in.Config, Enabled: enabled,
+		Name: effective.Name, Type: effective.Type, Config: patchConfig,
+		Enabled: effective.Enabled, MonthlyQuota: effective.MonthlyQuota,
 	})
 	if err != nil {
 		s.storeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.channelDTO(updated, nil))
+	writeJSON(w, http.StatusOK, s.channelDTO(updated, nil, s.loadQuotaSnapshot()))
 }
 
 func (s *Server) handleAdminDeleteChannel(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.DeleteChannel(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if err := s.store.DeleteChannel(id); err != nil {
 		s.storeError(w, err)
 		return
 	}
+	// Quota rows live in SQLite and are not part of the JSON store, so clean
+	// them up best-effort: a failure must not fail the delete.
+	if err := s.db.DeleteChannelUsage(id); err != nil {
+		s.log.Warn("delete channel usage failed", "channel", id, "err", err)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleAdminResetChannelQuota clears the current period counter of one
+// channel, letting an operator recover a channel that hit its limit.
+func (s *Server) handleAdminResetChannelQuota(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	snapshot := s.store.Snapshot()
+	var channel *store.Channel
+	for i := range snapshot.Channels {
+		if snapshot.Channels[i].ID == id {
+			ch := snapshot.Channels[i]
+			channel = &ch
+			break
+		}
+	}
+	if channel == nil {
+		writeError(w, http.StatusNotFound, "channel not found")
+		return
+	}
+	period := s.cfg.QuotaPeriod(time.Now())
+	if err := s.db.ResetChannelUsage(period, id); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":    true,
+		"quota": channelQuotaDTO(*channel, s.loadQuotaSnapshot()),
+	})
 }
 
 func (s *Server) handleAdminTestChannel(w http.ResponseWriter, r *http.Request) {

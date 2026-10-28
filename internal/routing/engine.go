@@ -20,6 +20,11 @@ import (
 // ErrNoChannel means the route has no usable channel for the requested role.
 var ErrNoChannel = errors.New("route has no usable channel")
 
+// ErrQuotaExhausted means a channel was skipped because it reached its monthly
+// call quota. When every candidate of a route is in that state, the route
+// returns an error wrapping this sentinel.
+var ErrQuotaExhausted = errors.New("channel monthly quota exhausted")
+
 // Meta describes how a request was served.
 type Meta struct {
 	RouteID   string
@@ -141,10 +146,15 @@ func (e *Engine) fallbackSearchTargets(ctx context.Context, targets []routeTarge
 				errs = append(errs, fmt.Errorf("%s: %w", ch.Name, rt.searchErr))
 				continue
 			}
+			if !e.consumeQuota(ch) {
+				errs = append(errs, fmt.Errorf("%s: %w", ch.Name, ErrQuotaExhausted))
+				continue
+			}
 			e.recordAttempt(ch.ID, "search")
 			results, err := rt.search.Search(ctx, req)
 			if err != nil {
 				e.recordError(ch.ID, "search", err)
+				e.recordUsageError(ch)
 				errs = append(errs, fmt.Errorf("%s: %w", ch.Name, err))
 				e.log.Warn("channel search failed", "channel", ch.Name, "query", req.Query, "err", err)
 				continue
@@ -204,10 +214,15 @@ func (e *Engine) mergeSearchTargets(ctx context.Context, targets []routeTarget, 
 					outcomes[i].err = fmt.Errorf("%s: %w", ch.Name, rt.searchErr)
 					return
 				}
+				if !e.consumeQuota(ch) {
+					outcomes[i].err = fmt.Errorf("%s: %w", ch.Name, ErrQuotaExhausted)
+					return
+				}
 				e.recordAttempt(ch.ID, "search")
 				results, err := rt.search.Search(ctx, req)
 				if err != nil {
 					e.recordError(ch.ID, "search", err)
+					e.recordUsageError(ch)
 					outcomes[i].err = fmt.Errorf("%s: %w", ch.Name, err)
 					return
 				}
@@ -305,10 +320,15 @@ func (e *Engine) fetchRoute(ctx context.Context, route store.Route, rawURL strin
 				errs = append(errs, fmt.Errorf("%s: %w", ch.Name, rt.fetchErr))
 				continue
 			}
+			if !e.consumeQuota(ch) {
+				errs = append(errs, fmt.Errorf("%s: %w", ch.Name, ErrQuotaExhausted))
+				continue
+			}
 			e.recordAttempt(ch.ID, "fetch")
 			result, err := rt.fetch.Fetch(ctx, rawURL)
 			if err != nil {
 				e.recordError(ch.ID, "fetch", err)
+				e.recordUsageError(ch)
 				errs = append(errs, fmt.Errorf("%s: %w", ch.Name, err))
 				e.log.Warn("channel fetch failed", "channel", ch.Name, "url", rawURL, "err", err)
 				continue
@@ -528,6 +548,31 @@ func (e *Engine) TestChannel(ctx context.Context, ch store.Channel, query, rawUR
 		return rt.fetch.Fetch(ctx, rawURL)
 	}
 	return nil, fmt.Errorf("query or url is required")
+}
+
+// consumeQuota counts one upstream call against the channel's monthly quota
+// immediately before the provider is invoked. It reports false when the channel
+// has already served its limit, so the caller must skip it. Counter failures
+// fail open: a broken database must not take the gateway down.
+func (e *Engine) consumeQuota(ch store.Channel) bool {
+	period := e.cfg.QuotaPeriod(time.Now())
+	allowed, err := e.db.ConsumeChannelQuota(ch.ID, period, ch.MonthlyQuota)
+	if err != nil {
+		e.log.Warn("consume channel quota failed, allowing request",
+			"channel", ch.Name, "period", period, "err", err)
+		return true
+	}
+	return allowed
+}
+
+// recordUsageError counts a failed upstream call in the channel's quota period.
+// The call itself was already counted by consumeQuota.
+func (e *Engine) recordUsageError(ch store.Channel) {
+	period := e.cfg.QuotaPeriod(time.Now())
+	if err := e.db.RecordChannelUsageError(ch.ID, period); err != nil {
+		e.log.Warn("record channel quota error failed",
+			"channel", ch.Name, "period", period, "err", err)
+	}
 }
 
 func (e *Engine) recordAttempt(id, role string) {

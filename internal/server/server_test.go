@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"search-gateway/internal/config"
 	"search-gateway/internal/db"
@@ -39,6 +40,14 @@ func loadTestConfig(t *testing.T, raw string) *config.Config {
 
 func newTestStack(t *testing.T, raw string) (*httptest.Server, *config.Config) {
 	t.Helper()
+	ts, cfg, _ := newTestStackWithDB(t, raw)
+	return ts, cfg
+}
+
+// newTestStackWithDB additionally exposes the SQLite handle, so tests can
+// assert on quota rows that are not visible through the admin API.
+func newTestStackWithDB(t *testing.T, raw string) (*httptest.Server, *config.Config, *db.DB) {
+	t.Helper()
 	cfg := loadTestConfig(t, raw)
 	dir := t.TempDir()
 	cfg.StorePath = filepath.Join(dir, "store.json")
@@ -61,7 +70,7 @@ func newTestStack(t *testing.T, raw string) (*httptest.Server, *config.Config) {
 		ts.Close()
 		database.Close()
 	})
-	return ts, cfg
+	return ts, cfg, database
 }
 
 func fakeSearxng(t *testing.T, tag string) *httptest.Server {
@@ -679,5 +688,304 @@ func TestUnsupportedChannelTypeAPI(t *testing.T) {
 		case "generic", "nope":
 			t.Fatalf("unsupported channel was created: %s", ch)
 		}
+	}
+}
+
+func listAdminChannels(t *testing.T, ts *httptest.Server) []any {
+	t.Helper()
+	resp, data := doRequest(t, http.MethodGet, ts.URL+"/admin/api/channels", adminToken, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list channels: %d %s", resp.StatusCode, data)
+	}
+	channels, _ := decodeMap(t, data)["channels"].([]any)
+	return channels
+}
+
+func channelByName(t *testing.T, ts *httptest.Server, name string) map[string]any {
+	t.Helper()
+	for _, raw := range listAdminChannels(t, ts) {
+		ch, _ := raw.(map[string]any)
+		if ch["name"] == name {
+			return ch
+		}
+	}
+	t.Fatalf("channel %q not found", name)
+	return nil
+}
+
+func overviewChannel(t *testing.T, ts *httptest.Server, name string) map[string]any {
+	t.Helper()
+	resp, data := doRequest(t, http.MethodGet, ts.URL+"/admin/api/overview", adminToken, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("overview: %d %s", resp.StatusCode, data)
+	}
+	for _, raw := range decodeMap(t, data)["channels"].([]any) {
+		ch, _ := raw.(map[string]any)
+		if ch["name"] == name {
+			return ch
+		}
+	}
+	t.Fatalf("channel %q missing from overview: %s", name, data)
+	return nil
+}
+
+func channelQuota(t *testing.T, ch map[string]any) map[string]any {
+	t.Helper()
+	quota, _ := ch["quota"].(map[string]any)
+	if quota == nil {
+		t.Fatalf("channel %v has no quota object: %v", ch["name"], ch)
+	}
+	return quota
+}
+
+func assertQuotaNumber(t *testing.T, quota map[string]any, field string, want float64) {
+	t.Helper()
+	if got := quota[field]; got != want {
+		t.Fatalf("quota.%s = %v, want %v (quota: %v)", field, got, want, quota)
+	}
+}
+
+func TestChannelQuotaAdminAPI(t *testing.T) {
+	sxA := fakeSearxng(t, "a")
+	sxB := fakeSearxng(t, "b")
+	ts, cfg, database := newTestStackWithDB(t, legacyConfig(t, sxA.URL))
+	period := cfg.QuotaPeriod(time.Now())
+
+	// The seeded channel exposes a quota object: unlimited and zero usage.
+	channelA := channelByName(t, ts, "sx-a")
+	channelAID, _ := channelA["id"].(string)
+	quotaA := channelQuota(t, channelA)
+	assertQuotaNumber(t, quotaA, "monthly_limit", 0)
+	assertQuotaNumber(t, quotaA, "used", 0)
+	assertQuotaNumber(t, quotaA, "errors", 0)
+	assertQuotaNumber(t, quotaA, "remaining", 0)
+	if quotaA["unlimited"] != true || quotaA["exhausted"] != false {
+		t.Fatalf("initial quota flags = %v", quotaA)
+	}
+	if quotaA["period"] != period {
+		t.Fatalf("quota period = %v, want %q", quotaA["period"], period)
+	}
+	resetsRaw, _ := quotaA["resets_at"].(string)
+	resetsAt, err := time.Parse(time.RFC3339, resetsRaw)
+	if err != nil {
+		t.Fatalf("resets_at %q is not RFC3339: %v", resetsRaw, err)
+	}
+	_, wantResetsAt := cfg.QuotaPeriodBounds(time.Now())
+	if !resetsAt.Equal(wantResetsAt) {
+		t.Fatalf("resets_at = %v, want %v", resetsAt, wantResetsAt)
+	}
+
+	// POST without monthly_quota defaults to unlimited.
+	createResp, createData := doRequest(t, http.MethodPost, ts.URL+"/admin/api/channels", adminToken,
+		fmt.Sprintf(`{"name":"sx-b","type":"searxng","enabled":true,"config":{"base_url":%q}}`, sxB.URL))
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create sx-b: %d %s", createResp.StatusCode, createData)
+	}
+	createdB := decodeMap(t, createData)
+	channelBID, _ := createdB["id"].(string)
+	assertQuotaNumber(t, channelQuota(t, createdB), "monthly_limit", 0)
+
+	// A partial PATCH that only carries monthly_quota updates nothing else.
+	patchResp, patchData := doRequest(t, http.MethodPatch, ts.URL+"/admin/api/channels/"+channelBID, adminToken,
+		`{"monthly_quota":1}`)
+	if patchResp.StatusCode != http.StatusOK {
+		t.Fatalf("partial quota patch: %d %s", patchResp.StatusCode, patchData)
+	}
+	patched := decodeMap(t, patchData)
+	if patched["name"] != "sx-b" || patched["type"] != "searxng" || patched["enabled"] != true {
+		t.Fatalf("partial patch changed identity fields: %s", patchData)
+	}
+	patchedConfig, _ := patched["config"].(map[string]any)
+	if patchedConfig["base_url"] != sxB.URL {
+		t.Fatalf("partial patch changed config: %s", patchData)
+	}
+	patchedQuota := channelQuota(t, patched)
+	assertQuotaNumber(t, patchedQuota, "monthly_limit", 1)
+	assertQuotaNumber(t, patchedQuota, "remaining", 1)
+	if patchedQuota["unlimited"] != false || patchedQuota["exhausted"] != false {
+		t.Fatalf("patched quota flags = %v", patchedQuota)
+	}
+	assertQuotaNumber(t, channelQuota(t, channelByName(t, ts, "sx-b")), "monthly_limit", 1)
+
+	// An old client toggling the channel (full config, no monthly_quota) must
+	// neither wipe the quota nor the stored config.
+	toggleResp, toggleData := doRequest(t, http.MethodPatch, ts.URL+"/admin/api/channels/"+channelBID, adminToken,
+		fmt.Sprintf(`{"name":"sx-b","type":"searxng","enabled":false,"config":{"base_url":%q}}`, sxB.URL))
+	if toggleResp.StatusCode != http.StatusOK {
+		t.Fatalf("toggle patch: %d %s", toggleResp.StatusCode, toggleData)
+	}
+	toggled := decodeMap(t, toggleData)
+	if toggled["enabled"] != false {
+		t.Fatalf("toggle did not disable channel: %s", toggleData)
+	}
+	assertQuotaNumber(t, channelQuota(t, toggled), "monthly_limit", 1)
+	toggledConfig, _ := toggled["config"].(map[string]any)
+	if toggledConfig["base_url"] != sxB.URL {
+		t.Fatalf("toggle patch lost config: %s", toggleData)
+	}
+	if resp, data := doRequest(t, http.MethodPatch, ts.URL+"/admin/api/channels/"+channelBID, adminToken,
+		`{"enabled":true}`); resp.StatusCode != http.StatusOK {
+		t.Fatalf("re-enable channel: %d %s", resp.StatusCode, data)
+	}
+
+	// Negative quotas are rejected and leave the stored value untouched.
+	if resp, data := doRequest(t, http.MethodPatch, ts.URL+"/admin/api/channels/"+channelBID, adminToken,
+		`{"monthly_quota":-1}`); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("negative quota patch = %d, want 400: %s", resp.StatusCode, data)
+	}
+	if resp, data := doRequest(t, http.MethodPost, ts.URL+"/admin/api/channels", adminToken,
+		fmt.Sprintf(`{"name":"neg","type":"searxng","config":{"base_url":%q},"monthly_quota":-1}`, sxB.URL)); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("negative quota create = %d, want 400: %s", resp.StatusCode, data)
+	}
+	assertQuotaNumber(t, channelQuota(t, channelByName(t, ts, "sx-b")), "monthly_limit", 1)
+
+	// Give sx-a a limit, use one call, then verify usage/remaining in both
+	// overview and the channel list.
+	if resp, data := doRequest(t, http.MethodPatch, ts.URL+"/admin/api/channels/"+channelAID, adminToken,
+		`{"monthly_quota":5}`); resp.StatusCode != http.StatusOK {
+		t.Fatalf("set sx-a quota: %d %s", resp.StatusCode, data)
+	}
+	searchResp, searchData := doRequest(t, http.MethodGet, ts.URL+"/search?q=quota&count=2", legacyToken, "")
+	if searchResp.StatusCode != http.StatusOK {
+		t.Fatalf("search for quota usage: %d %s", searchResp.StatusCode, searchData)
+	}
+	for _, ch := range []map[string]any{overviewChannel(t, ts, "sx-a"), channelByName(t, ts, "sx-a")} {
+		quota := channelQuota(t, ch)
+		assertQuotaNumber(t, quota, "monthly_limit", 5)
+		assertQuotaNumber(t, quota, "used", 1)
+		assertQuotaNumber(t, quota, "errors", 0)
+		assertQuotaNumber(t, quota, "remaining", 4)
+		if quota["unlimited"] != false || quota["exhausted"] != false {
+			t.Fatalf("sx-a quota flags = %v", quota)
+		}
+	}
+
+	// Resetting the current period zeroes the usage of that channel.
+	resetResp, resetData := doRequest(t, http.MethodPost,
+		ts.URL+"/admin/api/channels/"+channelAID+"/quota/reset", adminToken, "")
+	if resetResp.StatusCode != http.StatusOK {
+		t.Fatalf("reset quota: %d %s", resetResp.StatusCode, resetData)
+	}
+	resetOut := decodeMap(t, resetData)
+	if resetOut["ok"] != true {
+		t.Fatalf("reset response = %s", resetData)
+	}
+	resetQuota, _ := resetOut["quota"].(map[string]any)
+	assertQuotaNumber(t, resetQuota, "used", 0)
+	assertQuotaNumber(t, resetQuota, "remaining", 5)
+	if resetQuota["exhausted"] != false {
+		t.Fatalf("reset quota flags = %v", resetQuota)
+	}
+	if resp, _ := doRequest(t, http.MethodPost,
+		ts.URL+"/admin/api/channels/ch-missing/quota/reset", adminToken, ""); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("reset missing channel = %d, want 404", resp.StatusCode)
+	}
+
+	// Usage is counted again after the reset, and deleting the channel removes
+	// its quota rows from SQLite.
+	if resp, data := doRequest(t, http.MethodGet, ts.URL+"/search?q=quota2&count=2", legacyToken, ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("second search: %d %s", resp.StatusCode, data)
+	}
+	usage, err := database.ChannelUsage(period)
+	if err != nil {
+		t.Fatalf("channel usage: %v", err)
+	}
+	if got := usage[channelAID].Requests; got != 1 {
+		t.Fatalf("sx-a usage before delete = %d, want 1", got)
+	}
+	if resp, data := doRequest(t, http.MethodDelete, ts.URL+"/admin/api/channels/"+channelAID, adminToken, ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete channel: %d %s", resp.StatusCode, data)
+	}
+	usage, err = database.ChannelUsage(period)
+	if err != nil {
+		t.Fatalf("channel usage after delete: %v", err)
+	}
+	if _, ok := usage[channelAID]; ok {
+		t.Fatalf("channel usage row survived deletion: %+v", usage)
+	}
+	for _, raw := range listAdminChannels(t, ts) {
+		if ch, _ := raw.(map[string]any); ch["id"] == channelAID {
+			t.Fatalf("deleted channel still listed: %v", ch)
+		}
+	}
+}
+
+func TestQuotaExceededSearchReturns503(t *testing.T) {
+	sxA := fakeSearxng(t, "a")
+	sxB := fakeSearxng(t, "b")
+	ts, _ := newTestStack(t, legacyConfig(t, sxA.URL))
+
+	// A dedicated channel with a quota of one call, on its own route.
+	createResp, createData := doRequest(t, http.MethodPost, ts.URL+"/admin/api/channels", adminToken,
+		fmt.Sprintf(`{"name":"sx-b","type":"searxng","enabled":true,"config":{"base_url":%q},"monthly_quota":1}`, sxB.URL))
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create sx-b: %d %s", createResp.StatusCode, createData)
+	}
+	channelBID, _ := decodeMap(t, createData)["id"].(string)
+	assertQuotaNumber(t, channelQuota(t, decodeMap(t, createData)), "monthly_limit", 1)
+
+	routeResp, routeData := doRequest(t, http.MethodPost, ts.URL+"/admin/api/routes", adminToken,
+		fmt.Sprintf(`{"name":"quota-b","mode":"fallback","enabled":true,"search_channels":[%q]}`, channelBID))
+	if routeResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create quota route: %d %s", routeResp.StatusCode, routeData)
+	}
+	routeID, _ := decodeMap(t, routeData)["id"].(string)
+	keyResp, keyData := doRequest(t, http.MethodPost, ts.URL+"/admin/api/keys", adminToken,
+		fmt.Sprintf(`{"name":"key-quota","route_id":%q}`, routeID))
+	if keyResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create quota key: %d %s", keyResp.StatusCode, keyData)
+	}
+	token, _ := decodeMap(t, keyData)["token"].(string)
+
+	firstResp, firstData := doRequest(t, http.MethodGet, ts.URL+"/search?q=hello&count=2", token, "")
+	if firstResp.StatusCode != http.StatusOK {
+		t.Fatalf("first quota search: %d %s", firstResp.StatusCode, firstData)
+	}
+	quota := channelQuota(t, overviewChannel(t, ts, "sx-b"))
+	assertQuotaNumber(t, quota, "used", 1)
+	assertQuotaNumber(t, quota, "remaining", 0)
+	if quota["exhausted"] != true || quota["unlimited"] != false {
+		t.Fatalf("exhausted quota = %v", quota)
+	}
+
+	secondResp, secondData := doRequest(t, http.MethodGet, ts.URL+"/search?q=hello&count=2", token, "")
+	if secondResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("exhausted search = %d, want 503: %s", secondResp.StatusCode, secondData)
+	}
+	errObj, _ := decodeMap(t, secondData)["error"].(map[string]any)
+	message := fmt.Sprint(errObj["message"])
+	if !strings.Contains(strings.ToLower(message), "quota") {
+		t.Fatalf("503 message %q does not mention quota", message)
+	}
+
+	// Another channel with remaining quota still serves the same client traffic.
+	if resp, data := doRequest(t, http.MethodGet, ts.URL+"/search?q=hello&count=2", legacyToken, ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("unlimited channel search: %d %s", resp.StatusCode, data)
+	}
+
+	// Resetting the period makes the exhausted channel usable again.
+	resetResp, resetData := doRequest(t, http.MethodPost,
+		ts.URL+"/admin/api/channels/"+channelBID+"/quota/reset", adminToken, "")
+	if resetResp.StatusCode != http.StatusOK {
+		t.Fatalf("reset exhausted channel: %d %s", resetResp.StatusCode, resetData)
+	}
+	resetOut := decodeMap(t, resetData)
+	if resetOut["ok"] != true {
+		t.Fatalf("reset response = %s", resetData)
+	}
+	resetQuota, _ := resetOut["quota"].(map[string]any)
+	assertQuotaNumber(t, resetQuota, "used", 0)
+	assertQuotaNumber(t, resetQuota, "monthly_limit", 1)
+	if resetQuota["exhausted"] != false {
+		t.Fatalf("reset quota flags = %v", resetQuota)
+	}
+
+	if resp, data := doRequest(t, http.MethodGet, ts.URL+"/search?q=hello&count=2", token, ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("search after quota reset: %d %s", resp.StatusCode, data)
+	}
+	quota = channelQuota(t, channelByName(t, ts, "sx-b"))
+	assertQuotaNumber(t, quota, "used", 1)
+	if quota["exhausted"] != true {
+		t.Fatalf("reused quota after reset = %v", quota)
 	}
 }

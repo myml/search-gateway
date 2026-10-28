@@ -3,6 +3,7 @@ package db
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -183,5 +184,129 @@ func TestDatabasePermissions(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("db mode = %o", info.Mode().Perm())
+	}
+}
+
+func TestChannelUsageAndQuota(t *testing.T) {
+	database := newTestDB(t)
+	const period = "2026-10"
+
+	allowed, err := database.ConsumeChannelQuota("ch_1", period, 2)
+	if err != nil || !allowed {
+		t.Fatalf("first consume = %v, %v", allowed, err)
+	}
+	if allowed, err = database.ConsumeChannelQuota("ch_1", period, 2); err != nil || !allowed {
+		t.Fatalf("second consume = %v, %v", allowed, err)
+	}
+	if allowed, err = database.ConsumeChannelQuota("ch_1", period, 2); err != nil || allowed {
+		t.Fatalf("third consume = %v, %v", allowed, err)
+	}
+	usage, err := database.ChannelUsage(period)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := usage["ch_1"]; got.Requests != 2 || got.Errors != 0 {
+		t.Fatalf("usage = %+v", got)
+	}
+
+	// Unlimited channels keep counting calls.
+	if allowed, err = database.ConsumeChannelQuota("ch_1", period, 0); err != nil || !allowed {
+		t.Fatalf("unlimited consume = %v, %v", allowed, err)
+	}
+	if err := database.RecordChannelUsageError("ch_1", period); err != nil {
+		t.Fatal(err)
+	}
+	if usage, err = database.ChannelUsage(period); err != nil {
+		t.Fatal(err)
+	}
+	if got := usage["ch_1"]; got.Requests != 3 || got.Errors != 1 {
+		t.Fatalf("usage after error = %+v", got)
+	}
+
+	// A new period starts from zero.
+	if allowed, err = database.ConsumeChannelQuota("ch_1", "2026-11", 1); err != nil || !allowed {
+		t.Fatalf("next period consume = %v, %v", allowed, err)
+	}
+	if allowed, err = database.ConsumeChannelQuota("ch_1", "2026-11", 1); err != nil || allowed {
+		t.Fatalf("next period second consume = %v, %v", allowed, err)
+	}
+
+	if err := database.ResetChannelUsage(period, "ch_1"); err != nil {
+		t.Fatal(err)
+	}
+	if usage, err = database.ChannelUsage(period); err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) != 0 {
+		t.Fatalf("usage after reset = %+v", usage)
+	}
+	if usage, err = database.ChannelUsage("2026-11"); err != nil || usage["ch_1"].Requests != 1 {
+		t.Fatalf("other period usage = %+v, %v", usage, err)
+	}
+}
+
+func TestChannelQuotaIsAtomicUnderConcurrency(t *testing.T) {
+	database := newTestDB(t)
+	const period = "2026-10"
+	const limit = 10
+	const attempts = 40
+
+	results := make(chan bool, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			allowed, err := database.ConsumeChannelQuota("ch_1", period, limit)
+			if err != nil {
+				t.Errorf("consume: %v", err)
+				return
+			}
+			results <- allowed
+		}()
+	}
+	wg.Wait()
+	close(results)
+	allowedCount := 0
+	for allowed := range results {
+		if allowed {
+			allowedCount++
+		}
+	}
+	if allowedCount != limit {
+		t.Fatalf("allowed = %d, want %d", allowedCount, limit)
+	}
+	usage, err := database.ChannelUsage(period)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := usage["ch_1"].Requests; got != limit {
+		t.Fatalf("requests = %d, want %d", got, limit)
+	}
+}
+
+func TestResetChannelUsageForWholePeriodAndDelete(t *testing.T) {
+	database := newTestDB(t)
+	const period = "2026-10"
+	for _, id := range []string{"ch_1", "ch_2"} {
+		if _, err := database.ConsumeChannelQuota(id, period, 5); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := database.ResetChannelUsage(period, ""); err != nil {
+		t.Fatal(err)
+	}
+	if usage, err := database.ChannelUsage(period); err != nil || len(usage) != 0 {
+		t.Fatalf("usage after period reset = %+v, %v", usage, err)
+	}
+
+	if _, err := database.ConsumeChannelQuota("ch_1", period, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DeleteChannelUsage("ch_1"); err != nil {
+		t.Fatal(err)
+	}
+	if usage, err := database.ChannelUsage(period); err != nil || len(usage) != 0 {
+		t.Fatalf("usage after delete = %+v, %v", usage, err)
 	}
 }

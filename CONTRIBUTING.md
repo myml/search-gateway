@@ -45,7 +45,7 @@ deploy/                Podman / systemd / Traefik 部署模板
 
 ### 核心模型
 
-- **Channel**：一个搜索或抓取上游，类型固定，配置包含 Key、Base URL、代理、超时、Headers、UA。
+- **Channel**：一个搜索或抓取上游，类型固定，配置包含 Key、Base URL、代理、超时、Headers、UA 和月度额度（`monthly_quota`，单位次，`0` 表示不限）。
 - **Route**：同一角色的渠道和/或子路由组成的有序目标列表，带执行模式和重试策略。
 - **API Key**：同时绑定一条搜索路由和一条抓取路由；只存 SHA-256 哈希和展示前缀。
 - **Call log**：记录协议、Key、路由、渠道、query/url、状态、耗时、来源 IP、UA、Request ID。
@@ -59,6 +59,8 @@ deploy/                Podman / systemd / Traefik 部署模板
 - `balance`：按轮询或随机起点执行，失败后继续尝试后续目标。
 - `max_retries`：限制失败后的额外尝试次数；`0` 表示不限制。
 - `fallback_on_empty`：搜索返回空结果时是否继续尝试下一个目标。
+- 额度：每次调用 provider 前先用 `ConsumeChannelQuota` 原子检查并计数渠道月度额度；已耗尽的渠道按不可用跳过，`fallback` / `merge` / `balance` / 嵌套组行为一致。全部候选耗尽时返回 `ErrQuotaExhausted`（HTTP `503`）。计数按 `quota_timezone` 的自然月分 period，不修改渠道的启停状态。
+- 管理台「测试渠道」（`Engine.TestChannel`）不经过路由，不受额度限制也不计数；「测试 API Key」走路由，受限并计数。
 - 组：父路由可以把同角色子路由当作目标；禁止自引用和循环。
 
 抓取路由不支持 `merge`，但支持 fallback、balance 和嵌套组。
@@ -118,9 +120,10 @@ node --check internal/server/ui/app.js
 | --- | --- | --- |
 | GET | `/admin/api/overview` | 计数、store 路径、渠道/路由/Key 明细与用量 |
 | GET/POST | `/admin/api/channels` | 列表 / 新建（新建前会构建一次 provider 校验配置） |
-| PATCH/DELETE | `/admin/api/channels/{id}` | 修改 / 删除（删除会清理路由引用） |
+| PATCH/DELETE | `/admin/api/channels/{id}` | 修改 / 删除（删除会清理路由引用）；PATCH body 支持顶层 `monthly_quota` |
 | POST | `/admin/api/channels/{id}/test` | 测试单个渠道，body 为 `{"query":"..."}` 或 `{"url":"..."}` |
 | POST | `/admin/api/channels/test` | 并发测试渠道；可传 `role`、`query`、`url`、`channel_ids` |
+| POST | `/admin/api/channels/{id}/quota/reset` | 重置该渠道当月额度用量，返回最新 `quota` 对象 |
 | GET/POST | `/admin/api/routes` | 列表 / 新建 |
 | PATCH/DELETE | `/admin/api/routes/{id}` | 修改 / 删除（被 Key 引用时返回 409） |
 | GET/POST | `/admin/api/keys` | 列表 / 签发（响应里的 `token` 只出现一次） |
@@ -128,6 +131,8 @@ node --check internal/server/ui/app.js
 | POST | `/admin/api/keys/{id}/test` | 按该 Key 的路由真实执行搜索和抓取 |
 | GET | `/admin/api/logs` | 过滤参数：`protocol`、`status`、`key_id`、`route_id`、`channel`、`q`、`since`、`until`、`limit`、`offset` |
 | POST | `/admin/api/logs/clear` | 清空调用日志 |
+
+渠道 DTO（`GET /admin/api/overview` 的 `channels`、`GET /admin/api/channels`、创建/更新响应）在原有字段外增加 `quota` 对象：`monthly_limit`、`used`、`errors`、`remaining`、`unlimited`、`exhausted`、`period`、`resets_at`。`POST /admin/api/channels` 支持可选顶层 `monthly_quota`（未提供为 0），`PATCH /admin/api/channels/{id}` 未提供该字段时保持当前值。
 
 ## 存储与数据
 
@@ -140,6 +145,7 @@ node --check internal/server/ui/app.js
 | `call_logs` | 搜索、抓取、Messages、MCP、渠道测试、鉴权失败 |
 | `channel_stats` | 每个渠道的请求数、错误数、最近错误、最近使用时间 |
 | `channel_tests` | 每个渠道按角色的最近测试结果 |
+| `channel_usage` | 每个渠道按自然月的调用次数和失败次数，主键 `(channel_id, period)` |
 | `key_stats` | 每个 API Key 的请求数、错误数、最近使用时间 |
 
 常用排查 SQL：
@@ -152,6 +158,7 @@ SELECT protocol, COUNT(*) FROM call_logs GROUP BY protocol;
 SELECT status, COUNT(*) FROM call_logs WHERE time >= datetime('now','-1 day') GROUP BY status;
 SELECT channel_id, search_requests, search_errors, fetch_requests, fetch_errors FROM channel_stats ORDER BY search_requests DESC;
 SELECT key_id, requests, errors FROM key_stats ORDER BY requests DESC;
+SELECT channel_id, period, requests, errors FROM channel_usage ORDER BY period DESC, requests DESC;
 ```
 
 ### 迁移注意事项
@@ -159,6 +166,8 @@ SELECT key_id, requests, errors FROM key_stats ORDER BY requests DESC;
 - 旧版本的单路由会自动拆成搜索路由和抓取路由，已有 Key 自动绑定两者。
 - `generic` 自定义协议渠道已移除；旧 store 中的 `generic` 渠道会在启动时删除，并从路由目标中移除。旧 `config.json` 中的 `type: "generic"` 会直接导致启动校验失败。
 - 旧 JSONL 日志会在 `call_logs` 为空时导入 SQLite；导入逻辑见 `internal/logstore`。
+- `channel_usage` 表在打开数据库时自动 `CREATE TABLE IF NOT EXISTS`，旧版 `gateway.db` 不需要手动迁移。
+- 旧 `store.json` 没有 `monthly_quota` 字段时按 `0`（不限量）读取，无需迁移；设置额度后会随下次保存写入。
 
 ## 构建与发布
 

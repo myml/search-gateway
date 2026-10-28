@@ -98,6 +98,7 @@ func (s *Server) routes() {
 	s.mux.Handle("PATCH /admin/api/channels/{id}", s.withAdmin(http.HandlerFunc(s.handleAdminUpdateChannel)))
 	s.mux.Handle("DELETE /admin/api/channels/{id}", s.withAdmin(http.HandlerFunc(s.handleAdminDeleteChannel)))
 	s.mux.Handle("POST /admin/api/channels/{id}/test", s.withAdmin(http.HandlerFunc(s.handleAdminTestChannel)))
+	s.mux.Handle("POST /admin/api/channels/{id}/quota/reset", s.withAdmin(http.HandlerFunc(s.handleAdminResetChannelQuota)))
 	s.mux.Handle("POST /admin/api/channels/test", s.withAdmin(http.HandlerFunc(s.handleAdminTestChannels)))
 	s.mux.Handle("GET /admin/api/routes", s.withAdmin(http.HandlerFunc(s.handleAdminListRoutes)))
 	s.mux.Handle("POST /admin/api/routes", s.withAdmin(http.HandlerFunc(s.handleAdminCreateRoute)))

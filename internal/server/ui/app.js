@@ -179,6 +179,63 @@
     return `<div class="chips"><span>${requests} 次${errors ? " ·" : ""}</span>${errors ? `<span class="tag err">${errors} 错误</span>` : ""}</div>`;
   };
 
+  /* -------- 渠道月度额度（channel.quota 可能缺失，按旧服务端降级） -------- */
+  const quotaInfo = (channel) => {
+    const quota = channel && channel.quota;
+    return quota && typeof quota === "object" ? quota : null;
+  };
+
+  const quotaStats = (quota) => {
+    const limit = Math.max(0, Number(quota.monthly_limit) || 0);
+    const used = Math.max(0, Number(quota.used) || 0);
+    const unlimited = quota.unlimited === true || limit === 0;
+    const exhausted = !unlimited && (quota.exhausted === true || used >= limit);
+    const remaining = Number.isFinite(Number(quota.remaining))
+      ? Math.max(0, Number(quota.remaining))
+      : Math.max(0, limit - used);
+    const pct = unlimited ? 0 : Math.min(100, (used / limit) * 100);
+    const level = unlimited ? "unlimited" : exhausted ? "err" : pct >= 80 ? "warn" : "";
+    return { limit, used, unlimited, exhausted, remaining, pct, level };
+  };
+
+  const quotaCell = (channel) => {
+    const quota = quotaInfo(channel);
+    if (!quota) return '<span class="muted">—</span>';
+    const q = quotaStats(quota);
+    if (q.unlimited) {
+      return `<div class="quota"><div class="quota-line"><span class="tag">不限</span><span class="quota-meta">本月 ${esc(q.used)} 次</span></div></div>`;
+    }
+    return `<div class="quota ${q.level}">
+      <div class="quota-line"><span class="quota-count">${esc(q.used)} / ${esc(q.limit)} 次</span>${q.exhausted ? '<span class="tag err">额度用尽</span>' : ""}</div>
+      <div class="quota-bar"><span style="width:${q.pct.toFixed(1)}%"></span></div>
+      <div class="quota-meta">${q.exhausted ? "已自动跳过，次月恢复" : `剩余 ${esc(q.remaining)} 次`}</div>
+    </div>`;
+  };
+
+  const quotaOverviewLine = (channel) => {
+    const quota = quotaInfo(channel);
+    if (!quota) return "";
+    const q = quotaStats(quota);
+    if (q.unlimited) {
+      return `<div class="quota-mini" title="本月额度不限，已用 ${esc(q.used)} 次">不限 · 已用${esc(q.used)}</div>`;
+    }
+    const label = q.exhausted ? "额度用尽" : `${Math.round(q.pct)}% · 剩${q.remaining}`;
+    const title = q.exhausted
+      ? `本月额度用尽（${q.used} / ${q.limit} 次），已自动跳过`
+      : `本月额度 ${q.used} / ${q.limit} 次，剩余 ${q.remaining} 次`;
+    return `<div class="quota-mini ${q.level}" title="${esc(title)}">${esc(label)}</div>`;
+  };
+
+  const quotaUsageBlock = (quota) => {
+    const q = quotaStats(quota);
+    const resetText = quota.resets_at ? esc(fmtTime(quota.resets_at)) : "次月自动重置";
+    return `<div class="quota ${q.level}">
+      <div class="quota-line"><span class="quota-count">${esc(q.used)} / ${esc(q.limit)} 次</span>${q.exhausted ? '<span class="tag err">额度用尽</span>' : `<span class="quota-meta">剩余 ${esc(q.remaining)} 次</span>`}</div>
+      <div class="quota-bar"><span style="width:${q.pct.toFixed(1)}%"></span></div>
+      <div class="quota-meta">下次重置：${resetText}${quota.period ? ` · 周期 ${esc(quota.period)}` : ""}</div>
+    </div>`;
+  };
+
   const routeTargetChips = (route, role) => {
     const isSearch = role === "search";
     const order = route[isSearch ? "search_order" : "fetch_order"] || [];
@@ -269,9 +326,7 @@
   }
 
   /* ---------------- overlay / modal ---------------- */
-  let overlayCleanup = null;
-  let overlayOnClose = null;
-  let restoreFocus = null;
+  const overlayStack = [];
 
   function trapFocus(container) {
     const selector = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
@@ -293,48 +348,57 @@
     return () => container.removeEventListener("keydown", onKey);
   }
 
-  function closeOverlay(restore = true) {
-    const onClose = overlayOnClose;
-    overlayOnClose = null;
-    if (overlayCleanup) {
-      overlayCleanup();
-      overlayCleanup = null;
+  function closeTopOverlay(restore = true) {
+    const entry = overlayStack.pop();
+    if (!entry) return;
+    if (entry.cleanup) entry.cleanup();
+    entry.el.remove();
+    if (!overlayStack.length) document.body.classList.remove("overlay-open");
+    if (entry.onClose) entry.onClose();
+    if (restore && entry.restoreFocus && typeof entry.restoreFocus.focus === "function" && document.contains(entry.restoreFocus)) {
+      try { entry.restoreFocus.focus({ preventScroll: true }); } catch { /* ignore */ }
     }
-    $("modalRoot").innerHTML = "";
-    document.body.classList.remove("overlay-open");
-    if (onClose) onClose();
-    if (restore && restoreFocus && typeof restoreFocus.focus === "function" && document.contains(restoreFocus)) {
-      try { restoreFocus.focus({ preventScroll: true }); } catch { /* ignore */ }
-    }
-    restoreFocus = null;
   }
 
-  function openOverlay(html) {
-    closeOverlay();
-    restoreFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  function closeOverlay(restore = true) {
+    while (overlayStack.length) closeTopOverlay(restore);
+    document.body.classList.remove("overlay-open");
+  }
+
+  function openOverlay(html, { stack = false, onClose = null } = {}) {
+    if (!stack) closeOverlay();
     const root = $("modalRoot");
-    root.innerHTML = html;
-    const overlay = root.firstElementChild;
+    root.insertAdjacentHTML("beforeend", html);
+    const overlay = root.lastElementChild;
     if (!overlay) return null;
+    const entry = {
+      el: overlay,
+      onClose,
+      cleanup: null,
+      restoreFocus: document.activeElement instanceof HTMLElement ? document.activeElement : null,
+    };
+    overlayStack.push(entry);
     document.body.classList.add("overlay-open");
     const releaseTrap = trapFocus(overlay);
+    const isTop = () => overlayStack[overlayStack.length - 1] === entry;
     const onKey = (event) => {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || !isTop()) return;
       event.preventDefault();
       event.stopPropagation();
-      closeOverlay();
+      closeTopOverlay();
     };
     const onBackdrop = (event) => {
-      if (event.target === overlay) closeOverlay();
+      if (event.target === overlay) closeTopOverlay();
     };
     document.addEventListener("keydown", onKey, true);
     overlay.addEventListener("mousedown", onBackdrop);
-    overlayCleanup = () => {
+    entry.cleanup = () => {
       document.removeEventListener("keydown", onKey, true);
       overlay.removeEventListener("mousedown", onBackdrop);
       releaseTrap();
     };
     setTimeout(() => {
+      if (!overlay.isConnected) return;
       const target = overlay.querySelector("[autofocus]")
         || overlay.querySelector(".drawer")
         || overlay.querySelector(".modal-body input:not([type=hidden]):not([disabled]), .modal-body select, .modal-body textarea, .modal-body button")
@@ -396,10 +460,15 @@
     }, 40);
   }
 
-  function confirmDialog({ title, message, confirmLabel = "确认", cancelLabel = "取消", danger = false }) {
+  function confirmDialog({ title, message, confirmLabel = "确认", cancelLabel = "取消", danger = false, stack = false }) {
     return new Promise((resolve) => {
       let finished = false;
-      let releaseTrap = null;
+      const settle = (value) => {
+        if (finished) return false;
+        finished = true;
+        resolve(value);
+        return true;
+      };
       const overlay = openOverlay(`<div class="overlay">
         <div class="modal sm" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
           <div class="modal-head">
@@ -414,29 +483,22 @@
             </div>
           </div>
         </div>
-      </div>`);
+      </div>`, { stack, onClose: () => settle(false) });
       if (!overlay) {
-        resolve(false);
+        settle(false);
         return;
       }
-      releaseTrap = trapFocus(overlay);
-      overlayOnClose = () => {
-        if (finished) return;
-        finished = true;
-        releaseTrap();
-        resolve(false);
-      };
       const finish = (value) => {
-        if (finished) return;
-        finished = true;
-        releaseTrap();
-        resolve(value);
-        closeOverlay();
+        if (!settle(value)) return;
+        closeTopOverlay();
       };
       $("confirmCancel").onclick = () => finish(false);
       $("confirmClose").onclick = () => finish(false);
       $("confirmOK").onclick = () => finish(true);
-      setTimeout(() => $("confirmOK").focus(), 30);
+      setTimeout(() => {
+        const ok = $("confirmOK");
+        if (ok) ok.focus();
+      }, 30);
     });
   }
 
@@ -584,7 +646,7 @@
         <td data-label="渠道"><div class="cell-title">${esc(channel.name)}</div><div class="cell-sub">${providerTag(channel.type)}${channel.enabled ? "" : " · 已停用"}</div></td>
         <td data-label="角色">${roles || '<span class="muted">—</span>'}</td>
         <td data-label="最近测试">${channelTestSummary(channel)}</td>
-        <td data-label="请求 / 错误"><div class="chips"><span>${requests}${errors ? " ·" : ""}</span>${errors ? `<span class="tag err">${errors} 错误</span>` : ""}</div></td>
+        <td data-label="请求 / 错误"><div class="chips"><span>${requests}${errors ? " ·" : ""}</span>${errors ? `<span class="tag err">${errors} 错误</span>` : ""}</div>${quotaOverviewLine(channel)}</td>
         <td data-label="最近调用">${timeCell(stats.last_used_at)}</td>
       </tr>`;
     }).join("");
@@ -716,6 +778,7 @@
       <td data-label="状态">${statusDot(channel.enabled)}</td>
       <td data-label="最近测试">${channelTestSummary(channel)}</td>
       <td data-label="用量">${channelUsage(channel, role)}</td>
+      <td data-label="本月额度">${quotaCell(channel)}</td>
       <td data-label="更新时间">${timeCell(channel.updated_at)}</td>
       <td data-label="" class="cell-actions"><div class="row-actions">
         <button class="btn btn-ghost btn-sm" data-test="${esc(channel.id)}">${ICON("play")}测试</button>
@@ -730,8 +793,8 @@
         <button class="btn btn-primary" data-new-channel>${ICON("plus")}新建${isSearch ? "搜索" : "抓取"}渠道</button>`) + `
       <section class="card">
         <div class="table-wrap"><table class="table">
-          <thead><tr><th>名称</th><th>提供商</th><th>状态</th><th>最近测试</th><th>用量</th><th>更新时间</th><th></th></tr></thead>
-          <tbody>${rows || `<tr><td colspan="7" data-label="">
+          <thead><tr><th>名称</th><th>提供商</th><th>状态</th><th>最近测试</th><th>用量</th><th>本月额度</th><th>更新时间</th><th></th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="8" data-label="">
             ${emptyState(isSearch ? "search" : "fetch", `还没有${title}`, `<button class="btn btn-primary btn-sm" data-new-channel>${ICON("plus")}新建${title}</button>`)}
           </td></tr>`}</tbody>
         </table></div>
@@ -1119,6 +1182,7 @@ Header: Authorization: Bearer <YOUR_API_KEY>
       name: channel.name,
       type: channel.type,
       enabled: channel.enabled,
+      monthly_quota: channel.quota?.monthly_limit || 0,
       config: {
         base_url: cfg.base_url,
         proxy: cfg.proxy,
@@ -1204,6 +1268,9 @@ Header: Authorization: Bearer <YOUR_API_KEY>
     const initialDefault = CHANNEL_DEFAULTS[initialType] || "";
     const initialBase = cfg.base_url || (channel ? "" : initialDefault);
     const headerJSON = cfg.headers ? JSON.stringify(cfg.headers, null, 2) : "";
+    const quota = channel ? quotaInfo(channel) : null;
+    const quotaStat = quota ? quotaStats(quota) : null;
+    const quotaLimit = quotaStat && quotaStat.limit > 0 ? quotaStat.limit : 0;
     const body = `
       <div class="modal-section">
         <h3>基本信息</h3>
@@ -1250,6 +1317,23 @@ Header: Authorization: Bearer <YOUR_API_KEY>
             <span class="field-help">direct 抓取默认使用浏览器 UA；搜索渠道可留空。</span>
           </label>
         </div>
+      </div>
+      <div class="modal-section">
+        <h3>月度额度 <span class="hint">可选</span></h3>
+        <div class="form-grid">
+          <label class="field">
+            <span class="field-label">月度额度（次）</span>
+            <input type="number" min="0" step="1" inputmode="numeric" name="monthly_quota" value="${quotaLimit ? esc(quotaLimit) : ""}" placeholder="0 = 不限量">
+            <span class="field-help">留空或填 0 表示不限量。达到上限后该渠道会自动从路由中跳过，下个自然月自动恢复。</span>
+          </label>
+          ${quotaLimit ? `<div class="field">
+            <span class="field-label">本月用量</span>
+            <div id="chQuotaUsage">${quotaUsageBlock(quota)}</div>
+            <div class="quota-actions">
+              <button type="button" class="btn btn-ghost btn-sm" id="chQuotaReset">${ICON("refresh")}重置本月用量</button>
+            </div>
+          </div>` : ""}
+        </div>
       </div>`;
     openModal({
       title: channel ? `编辑渠道：${channel.name}` : `新建${role === "fetch" ? "抓取" : "搜索"}渠道`,
@@ -1266,9 +1350,15 @@ Header: Authorization: Bearer <YOUR_API_KEY>
         if (type === "searxng" && !val(fd, "base_url").trim()) {
           throw new Error("SearXNG 需要填写 Base URL，例如 http://127.0.0.1:8888");
         }
+        const rawQuota = val(fd, "monthly_quota");
+        const monthlyQuota = rawQuota === "" ? 0 : Number(rawQuota);
+        if (!Number.isInteger(monthlyQuota) || monthlyQuota < 0) {
+          throw new Error("月度额度需要填写 0 或正整数");
+        }
         const payload = {
           name: val(fd, "name"),
           type,
+          monthly_quota: monthlyQuota,
           config: {
             base_url: val(fd, "base_url"),
             proxy: val(fd, "proxy"),
@@ -1313,6 +1403,33 @@ Header: Authorization: Bearer <YOUR_API_KEY>
         baseEl.placeholder = nextDefault;
         hintEl.textContent = CHANNEL_HINTS[typeEl.value] || "";
         syncSite(typeEl.value);
+      };
+    }
+
+    const resetButton = $("chQuotaReset");
+    if (resetButton) {
+      resetButton.onclick = async () => {
+        const confirmed = await confirmDialog({
+          title: "重置本月用量？",
+          message: `将清零「${channel.name}」本月${quota.period ? `（${quota.period}）` : ""}的调用计数，月度额度设置不变，此操作不可撤销。`,
+          confirmLabel: "重置",
+          danger: true,
+          stack: true,
+        });
+        if (!confirmed) return;
+        resetButton.disabled = true;
+        resetButton.classList.add("is-busy");
+        const { resp, data } = await api(`/admin/api/channels/${channel.id}/quota/reset`, { method: "POST" });
+        resetButton.disabled = false;
+        resetButton.classList.remove("is-busy");
+        if (!resp.ok) return toast(data?.error?.message || "重置失败", "err");
+        toast("本月用量已重置");
+        await loadOverview();
+        render();
+        const fresh = state.channels.find((item) => item.id === channel.id) || channel;
+        const nextQuota = (data && data.quota) || quotaInfo(fresh);
+        const usage = $("chQuotaUsage");
+        if (usage && nextQuota) usage.innerHTML = quotaUsageBlock(nextQuota);
       };
     }
   }
